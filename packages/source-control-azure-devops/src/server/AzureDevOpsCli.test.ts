@@ -1,14 +1,18 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it, afterEach, describe, vi } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
 import { ChildProcessSpawner } from "effect/process";
 import { VcsProcessExitError, VcsProcessSpawnError } from "@t3tools/contracts";
 
 import type * as SourceControlHost from "@t3tools/source-control-core/server/SourceControlHost";
 import * as TestSourceControlHost from "@t3tools/source-control-testing/TestSourceControlHost";
+import * as HostProcess from "@t3tools/shared/HostProcess";
+import { SpawnExecutableResolution } from "@t3tools/shared/shell";
 import * as AzureDevOpsCli from "./AzureDevOpsCli.ts";
 
 const processOutput = (stdout: string): SourceControlHost.SourceControlProcessOutput => ({
@@ -21,9 +25,11 @@ const processOutput = (stdout: string): SourceControlHost.SourceControlProcessOu
 
 const mockRun = vi.fn<SourceControlHost.SourceControlHost["Service"]["process"]["run"]>();
 
+// The CLI layer is exercised on a host that spawns `az` itself, so the launcher upgrade stays out of these assertions.
 const layerSupport = Layer.mergeAll(
   TestSourceControlHost.layer({ process: { run: mockRun } }),
   NodeServices.layer,
+  Layer.succeed(HostProcess.Platform, "linux"),
 );
 const layer = Layer.mergeAll(AzureDevOpsCli.layer.pipe(Layer.provide(layerSupport)), layerSupport);
 
@@ -270,5 +276,162 @@ describe("AzureDevOpsCli.layer", () => {
       assert.instanceOf(error, AzureDevOpsCli.AzureDevOpsCliRateLimitError);
       assert.strictEqual(error.cause, cause);
     }).pipe(Effect.provide(layer)),
+  );
+});
+
+describe("azureCliInvocation", () => {
+  it.effect("runs the launcher's interpreter in UTF-8 mode when its install has one", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const install = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-azure-cli-" });
+      const cli = path.join(install, "CLI2");
+      const wbin = path.join(cli, "wbin");
+      yield* fileSystem.makeDirectory(path.join(cli, "Lib", "site-packages", "azure", "cli"), {
+        recursive: true,
+      });
+      yield* fileSystem.makeDirectory(wbin, { recursive: true });
+      yield* fileSystem.writeFileString(path.join(cli, "python.exe"), "");
+      const azLauncher = path.join(wbin, "az.cmd");
+      yield* fileSystem.writeFileString(azLauncher, "");
+
+      const invocation = yield* AzureDevOpsCli.azureCliInvocation().pipe(
+        Effect.provideService(HostProcess.Platform, "win32"),
+        Effect.provideService(HostProcess.Environment, { PATH: install }),
+        Effect.provideService(SpawnExecutableResolution, () => azLauncher),
+      );
+
+      assert.deepStrictEqual(invocation, {
+        command: path.join(cli, "python.exe"),
+        args: ["-X", "utf8", "-IBm", "azure.cli"],
+        env: { AZ_INSTALLER: "MSI" },
+      });
+    }).pipe(Effect.provide(layerSupport)),
+  );
+
+  it.effect("runs the ZIP launcher's interpreter, labelled with its installer", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const install = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-azure-cli-zip-" });
+      yield* fileSystem.makeDirectory(path.join(install, "Lib", "site-packages", "azure", "cli"), {
+        recursive: true,
+      });
+      yield* fileSystem.writeFileString(path.join(install, "python.exe"), "");
+      const azLauncher = path.join(install, "bin", "az.cmd");
+      yield* fileSystem.makeDirectory(path.dirname(azLauncher), { recursive: true });
+      yield* fileSystem.writeFileString(azLauncher, "");
+
+      const invocation = yield* AzureDevOpsCli.azureCliInvocation().pipe(
+        Effect.provideService(HostProcess.Platform, "win32"),
+        Effect.provideService(HostProcess.Environment, { PATH: install }),
+        Effect.provideService(SpawnExecutableResolution, () => azLauncher),
+      );
+
+      assert.deepStrictEqual(invocation, {
+        command: path.join(install, "python.exe"),
+        args: ["-X", "utf8", "-IBm", "azure.cli"],
+        env: { AZ_INSTALLER: "ZIP" },
+      });
+    }).pipe(Effect.provide(layerSupport)),
+  );
+
+  it.effect("keeps the launcher, and claims ANSI output, when no interpreter sits beside it", () =>
+    Effect.gen(function* () {
+      const invocation = yield* AzureDevOpsCli.azureCliInvocation().pipe(
+        Effect.provideService(HostProcess.Platform, "win32"),
+        Effect.provideService(HostProcess.Environment, { PATH: "C:\\tools" }),
+        Effect.provideService(
+          SpawnExecutableResolution,
+          () => "C:\\tools\\azure-cli\\wbin\\az.cmd",
+        ),
+      );
+
+      assert.deepStrictEqual(invocation, {
+        command: "az",
+        args: [],
+        windowsAnsiOutput: true,
+      });
+    }).pipe(Effect.provide(layerSupport)),
+  );
+
+  it.effect("spawns az directly, with no claim about its encoding, off Windows", () =>
+    Effect.gen(function* () {
+      const invocation = yield* AzureDevOpsCli.azureCliInvocation().pipe(
+        Effect.provideService(HostProcess.Platform, "linux"),
+      );
+
+      assert.deepStrictEqual(invocation, { command: "az", args: [] });
+    }).pipe(Effect.provide(layerSupport)),
+  );
+});
+
+describe("AzureDevOpsCli.execute on Windows", () => {
+  it.effect("prepends the UTF-8 launch to every az command", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const install = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-azure-exec-" });
+      const cli = path.join(install, "CLI2");
+      yield* fileSystem.makeDirectory(path.join(cli, "Lib", "site-packages", "azure", "cli"), {
+        recursive: true,
+      });
+      yield* fileSystem.writeFileString(path.join(cli, "python.exe"), "");
+      const azLauncher = path.join(cli, "wbin", "az.cmd");
+      yield* fileSystem.makeDirectory(path.dirname(azLauncher), { recursive: true });
+      yield* fileSystem.writeFileString(azLauncher, "");
+
+      const support = Layer.mergeAll(
+        TestSourceControlHost.layer({ process: { run: mockRun } }),
+        NodeServices.layer,
+        Layer.succeed(HostProcess.Platform, "win32"),
+        Layer.succeed(HostProcess.Environment, { PATH: install }),
+        Layer.succeed(SpawnExecutableResolution, () => azLauncher),
+      );
+      const windowsLayer = Layer.mergeAll(
+        AzureDevOpsCli.layer.pipe(Layer.provide(support)),
+        support,
+      );
+
+      yield* Effect.gen(function* () {
+        mockRun.mockReturnValueOnce(Effect.succeed(processOutput("[]")));
+        const az = yield* AzureDevOpsCli.AzureDevOpsCli;
+        yield* az.listPullRequests({ cwd: "/repo", headSelector: "feature/x", state: "open" });
+
+        const { classifyFailure, ...call } = mockRun.mock.calls.at(-1)?.[0] ?? {};
+        assert.strictEqual(
+          classifyFailure?.("Please run az login to setup account."),
+          "authentication",
+        );
+        assert.deepStrictEqual(call, {
+          operation: "AzureDevOpsCli.execute",
+          command: path.join(cli, "python.exe"),
+          args: [
+            "-X",
+            "utf8",
+            "-IBm",
+            "azure.cli",
+            "repos",
+            "pr",
+            "list",
+            "--detect",
+            "true",
+            "--source-branch",
+            "feature/x",
+            "--status",
+            "active",
+            "--top",
+            "20",
+            "--only-show-errors",
+            "--output",
+            "json",
+          ],
+          cwd: "/repo",
+          env: { AZ_INSTALLER: "MSI" },
+          notFoundDetail: "Pull request not found.",
+          timeoutMs: 30_000,
+        });
+      }).pipe(Effect.provide(windowsLayer));
+    }).pipe(Effect.provide(layerSupport)),
   );
 });
