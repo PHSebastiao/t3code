@@ -1,5 +1,7 @@
 import { afterEach, assert, expect, it, vi } from "@effect/vitest";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import { ChildProcessSpawner } from "effect/process";
 
@@ -16,6 +18,7 @@ const layer = it.layer(
         execute: mockedExecute,
       }),
     ),
+    Layer.provideMerge(NodeServices.layer),
   ),
 );
 
@@ -85,6 +88,29 @@ function argsOfCall(index: number): ReadonlyArray<string> {
   const call = mockedExecute.mock.calls[index];
   assert.isDefined(call);
   return call[0].args;
+}
+
+type ExecuteInput = Parameters<AzureDevOpsCli.AzureDevOpsCli["Service"]["execute"]>[0];
+
+function descriptionFileArgument(input: ExecuteInput): string {
+  const index = input.args.indexOf("--description");
+  assert.isTrue(index >= 0);
+  const argument = input.args[index + 1];
+  assert.isDefined(argument);
+  assert.isTrue(argument.startsWith("@"));
+  return argument.slice(1);
+}
+
+function captureDescriptionFile(
+  fileSystem: FileSystem.FileSystem,
+  capture: (bodyFile: string, contents: string) => void,
+) {
+  return (input: ExecuteInput) =>
+    Effect.gen(function* () {
+      const bodyFile = descriptionFileArgument(input);
+      capture(bodyFile, yield* fileSystem.readFileString(bodyFile).pipe(Effect.orDie));
+      return output("{}");
+    });
 }
 
 function changeEntries(count: number): ReadonlyArray<Record<string, unknown>> {
@@ -326,18 +352,96 @@ layer("AzureDevOpsPullRequestCli.layer", (it) => {
     }),
   );
 
-  it.effect("sends a description that starts with a dash as one value, not as a flag", () =>
+  it.effect("writes a description that starts with a dash to a file, not to argv", () =>
     Effect.gen(function* () {
-      mockedExecute.mockReturnValue(Effect.succeed(output("{}")));
+      const fileSystem = yield* FileSystem.FileSystem;
+      const body = "- rewrote the page\n- kept the rest";
+      let bodyFile: string | undefined;
+      let stored: string | undefined;
+
+      mockedExecute.mockImplementationOnce(
+        captureDescriptionFile(fileSystem, (file, contents) => {
+          bodyFile = file;
+          stored = contents;
+        }),
+      );
       const cli = yield* AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCli;
 
       yield* cli.updatePullRequest({
         cwd: "/w",
         number: 42,
-        body: "- rewrote the page\n- kept the rest",
+        body,
       });
 
-      expect(argsOfCall(0)).toContain("--description=- rewrote the page\n- kept the rest");
+      assert.strictEqual(stored, body);
+      assert.isDefined(bodyFile);
+      assert.isFalse(yield* fileSystem.exists(bodyFile));
+    }),
+  );
+
+  it.effect("keeps every line of a multi-line description by passing a file", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const body = "## Summary\n\nline two\nline three";
+      let stored: string | undefined;
+
+      mockedExecute.mockImplementationOnce(
+        captureDescriptionFile(fileSystem, (_file, contents) => {
+          stored = contents;
+        }),
+      );
+      const cli = yield* AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCli;
+
+      yield* cli.updatePullRequest({
+        cwd: "/w",
+        number: 42,
+        body,
+      });
+
+      assert.strictEqual(stored, body);
+      assert.isFalse(argsOfCall(0).some((argument) => /[\r\n]/.test(argument)));
+    }),
+  );
+
+  it.effect("updates a title without creating a description file", () =>
+    Effect.gen(function* () {
+      mockedExecute.mockReturnValueOnce(Effect.succeed(output("{}")));
+      const cli = yield* AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCli;
+
+      yield* cli.updatePullRequest({ cwd: "/w", number: 42, title: "Rewrite the page" });
+
+      const args = argsOfCall(0);
+      expect(args).toContain("--title=Rewrite the page");
+      expect(args).not.toContain("--description");
+    }),
+  );
+
+  it.effect("removes the description file when Azure rejects the update", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      let bodyFile: string | undefined;
+
+      mockedExecute.mockImplementationOnce((input) =>
+        Effect.gen(function* () {
+          bodyFile = descriptionFileArgument(input);
+          return yield* new AzureDevOpsCli.AzureDevOpsCliAuthenticationError({
+            operation: "execute",
+            command: "az",
+            cwd: "/w",
+            argumentCount: input.args.length,
+            cause: new Error("signed out"),
+          });
+        }),
+      );
+      const cli = yield* AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCli;
+
+      const error = yield* Effect.flip(
+        cli.updatePullRequest({ cwd: "/w", number: 42, body: "line one\nline two" }),
+      );
+
+      assert.strictEqual(error._tag, "AzureDevOpsCliAuthenticationError");
+      assert.isDefined(bodyFile);
+      assert.isFalse(yield* fileSystem.exists(bodyFile));
     }),
   );
 

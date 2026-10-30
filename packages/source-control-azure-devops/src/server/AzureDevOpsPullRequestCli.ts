@@ -1,5 +1,6 @@
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
@@ -95,12 +96,29 @@ export class AzureDevOpsReviewerNameError extends Schema.TaggedError<AzureDevOps
   }
 }
 
+export class AzureDevOpsPullRequestDescriptionError extends Schema.TaggedError<AzureDevOpsPullRequestDescriptionError>()(
+  "AzureDevOpsPullRequestDescriptionError",
+  {
+    cwd: Schema.String,
+    cause: Schema.Defect(),
+  },
+) {
+  get detail(): string {
+    return "The pull request description could not be written to a temporary file.";
+  }
+
+  override get message(): string {
+    return `Azure DevOps pull request update failed: ${this.detail}`;
+  }
+}
+
 export type AzureDevOpsPullRequestCliError =
   | AzureDevOpsCli.AzureDevOpsCliError
   | AzureDevOpsPullRequestReadError
   | AzureDevOpsPullRequestIncompleteError
   | AzureDevOpsReviewerNameError
-  | AzureDevOpsViewerUnavailableError;
+  | AzureDevOpsViewerUnavailableError
+  | AzureDevOpsPullRequestDescriptionError;
 
 const REST_API_VERSION = "7.1";
 const PULL_REQUEST_LIST_MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
@@ -276,6 +294,7 @@ function isReviewerName(value: string): boolean {
 /** @public */
 export const make = Effect.gen(function* () {
   const azure = yield* AzureDevOpsCli.AzureDevOpsCli;
+  const fileSystem = yield* FileSystem.FileSystem;
 
   // Let `az` parse all three remote formats.
   const detectArgs = ["--detect", "true"] as const;
@@ -667,26 +686,48 @@ export const make = Effect.gen(function* () {
       },
     ),
 
-    updatePullRequest: Effect.fn("AzureDevOpsPullRequestCli.updatePullRequest")(function (input) {
-      return azure
-        .execute({
+    updatePullRequest: Effect.fn("AzureDevOpsPullRequestCli.updatePullRequest")(function* (input) {
+      const descriptionError = (cause: unknown) =>
+        new AzureDevOpsPullRequestDescriptionError({
           cwd: input.cwd,
-          args: [
-            "repos",
-            "pr",
-            "update",
-            ...detectArgs,
-            "--id",
-            String(input.number),
-            // One argv entry preserves leading dashes and multi-string descriptions.
-            ...(input.title === undefined ? [] : [`--title=${input.title}`]),
-            ...(input.body === undefined ? [] : [`--description=${input.body}`]),
-            "--only-show-errors",
-            "--output",
-            "json",
-          ],
-        })
-        .pipe(Effect.asVoid);
+          cause,
+        });
+      const run = (bodyFile: string | undefined) =>
+        azure
+          .execute({
+            cwd: input.cwd,
+            args: [
+              "repos",
+              "pr",
+              "update",
+              ...detectArgs,
+              "--id",
+              String(input.number),
+              ...(input.title === undefined ? [] : [`--title=${input.title}`]),
+              ...(bodyFile === undefined ? [] : ["--description", `@${bodyFile}`]),
+              "--only-show-errors",
+              "--output",
+              "json",
+            ],
+          })
+          .pipe(Effect.asVoid);
+
+      if (input.body === undefined) {
+        return yield* run(undefined);
+      }
+
+      const body = input.body;
+      return yield* Effect.scoped(
+        Effect.gen(function* () {
+          // `cmd.exe` ends the command at the first newline in an argument, so the body travels in a
+          // file. `az` parses `@file.json` as JSON, so the markdown body keeps a non-JSON suffix.
+          const bodyFile = yield* fileSystem
+            .makeTempFileScoped({ prefix: `t3code-pr-body-${process.pid}-`, suffix: ".md" })
+            .pipe(Effect.mapError(descriptionError));
+          yield* fileSystem.writeFileString(bodyFile, body).pipe(Effect.mapError(descriptionError));
+          return yield* run(bodyFile);
+        }),
+      );
     }),
   });
 });
