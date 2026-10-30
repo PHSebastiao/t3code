@@ -1,4 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off -- The interpreter sits beside the launcher it belongs to.
+import * as Context from "effect/Context";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 
@@ -44,3 +45,10 @@ export const azureCliInstall = (
   const interpreter = path.join(install, "python.exe");
   return pathExists(interpreter) ? { interpreter, installer } : undefined;
 };
+
+/** The launcher path comes from the host's PATH, so this reads the Windows layout it names. */
+export const AzureCliInstallLocation = Context.Reference<
+  (launcherPath: string) => AzureCliInstall | undefined
+>("@t3tools/source-control-azure-devops/azureCliInstallLocation", {
+  defaultValue: () => azureCliInstall,
+});
